@@ -1,4 +1,4 @@
-name: Slice Alibaba GPU trace
+name: Build Alibaba OR day
 
 on:
   workflow_dispatch:
@@ -8,22 +8,58 @@ on:
         required: true
         default: "0"
         type: string
-      hour:
-        description: "Trace hour (0..23)"
-        required: true
-        default: "0"
-        type: string
   push:
     paths:
-      - "cluster-trace-gpu-v2026/commands/slice.txt"
+      - "cluster-trace-gpu-v2026/commands/day.txt"
 
 permissions:
   contents: read
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      day: ${{ steps.day.outputs.day }}
+      day_id: ${{ steps.day.outputs.day_id }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+
+      - name: Resolve requested day
+        id: day
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_DAY: ${{ inputs.day }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            day=$((10#$DISPATCH_DAY))
+          else
+            command=$(tr -d '[:space:]' < cluster-trace-gpu-v2026/commands/day.txt)
+            if [[ ! "$command" =~ ^d([0-9]{3})$ ]]; then
+              echo "day.txt must contain exactly dDDD, e.g. d000" >&2
+              exit 2
+            fi
+            day=$((10#${BASH_REMATCH[1]}))
+          fi
+          if (( day < 0 || day > 184 )); then
+            echo "Invalid day=$day" >&2
+            exit 2
+          fi
+          printf 'day=%d\n' "$day" >> "$GITHUB_OUTPUT"
+          printf 'day_id=d%03d\n' "$day" >> "$GITHUB_OUTPUT"
+          printf 'Building all 24 hours for day %d\n' "$day"
+
   slice:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        hour: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
 
     steps:
       - name: Checkout fork
@@ -34,57 +70,70 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install slicer dependency
-        run: python -m pip install --disable-pip-version-check requests
+      - name: Install Range + compaction dependencies
+        run: python -m pip install --disable-pip-version-check requests duckdb
 
-      - name: Resolve requested slice
+      - name: Resolve slice id
         id: slice
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          DISPATCH_DAY: ${{ inputs.day }}
-          DISPATCH_HOUR: ${{ inputs.hour }}
+          DAY: ${{ needs.prepare.outputs.day }}
+          HOUR: ${{ matrix.hour }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            day=$((10#$DISPATCH_DAY))
-            hour=$((10#$DISPATCH_HOUR))
-          else
-            command=$(tr -d '[:space:]' < cluster-trace-gpu-v2026/commands/slice.txt)
-            if [[ ! "$command" =~ ^d([0-9]{3})h([0-9]{2})$ ]]; then
-              echo "slice.txt must contain exactly dDDDhHH, e.g. d000h00" >&2
-              exit 2
-            fi
-            day=$((10#${BASH_REMATCH[1]}))
-            hour=$((10#${BASH_REMATCH[2]}))
-          fi
-          if (( day < 0 || day > 184 || hour < 0 || hour > 23 )); then
-            echo "Invalid slice day=$day hour=$hour" >&2
-            exit 2
-          fi
-          printf 'day=%d\n' "$day" >> "$GITHUB_OUTPUT"
-          printf 'hour=%d\n' "$hour" >> "$GITHUB_OUTPUT"
-          printf 'id=d%03dh%02d\n' "$day" "$hour" >> "$GITHUB_OUTPUT"
+          printf 'id=d%03dh%02d\n' "$DAY" "$HOUR" >> "$GITHUB_OUTPUT"
 
-      - name: Range-extract pod and server Parquet
+      - name: Range-extract raw pod and server Parquet
         working-directory: cluster-trace-gpu-v2026/tools
         run: |
           python slice_hour.py \
-            --day '${{ steps.slice.outputs.day }}' \
-            --hour '${{ steps.slice.outputs.hour }}' \
-            --out '${{ github.workspace }}/slice-output'
+            --day '${{ needs.prepare.outputs.day }}' \
+            --hour '${{ matrix.hour }}' \
+            --out '${{ github.workspace }}/raw-output'
 
-      - name: Show proof of bounded Range transfer
-        shell: bash
+      - name: Compact to OR scheduling snapshot
+        working-directory: cluster-trace-gpu-v2026/tools
         run: |
-          cat 'slice-output/manifest_${{ steps.slice.outputs.id }}.json'
-          du -h slice-output/*
+          python compact_hour.py \
+            --day '${{ needs.prepare.outputs.day }}' \
+            --hour '${{ matrix.hour }}' \
+            --raw '${{ github.workspace }}/raw-output' \
+            --out '${{ github.workspace }}/or-output'
 
-      - name: Upload numbered slice
+      - name: Verify bounded Range transfer and compact outputs
+        shell: bash
+        env:
+          MANIFEST: or-output/manifest_or_${{ steps.slice.outputs.id }}.json
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['MANIFEST'])
+          m = json.loads(p.read_text())
+          files = m['raw_range_manifest']['files']
+          for f in files:
+              assert f['range_bytes_downloaded'] < f['source_zip_bytes'], f
+              assert f['range_requests'] > 0, f
+          for name, d in m['derived'].items():
+              assert d['rows'] >= 0 and d['bytes'] > 0, (name, d)
+          print(json.dumps({
+              'slice_id': m['slice_id'],
+              'raw_range_bytes': sum(f['range_bytes_downloaded'] for f in files),
+              'derived_bytes': m['derived_bytes_total'],
+              'derived_rows': {k: v['rows'] for k, v in m['derived'].items()},
+          }, indent=2))
+          PY
+          du -h or-output/*
+
+      - name: Delete raw hourly Parquet before artifact upload
+        run: rm -rf raw-output
+
+      - name: Upload compact numbered OR snapshot
         uses: actions/upload-artifact@v5
         with:
-          name: alibaba-${{ steps.slice.outputs.id }}
-          path: slice-output/
+          name: alibaba-or-${{ steps.slice.outputs.id }}
+          path: or-output/
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
