@@ -130,10 +130,71 @@ jobs:
         run: rm -rf raw-output
 
       - name: Upload compact numbered OR snapshot
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: alibaba-or-${{ steps.slice.outputs.id }}
           path: or-output/
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: error
+
+  bundle:
+    needs: [prepare, slice]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download all 24 hourly OR snapshots
+        uses: actions/download-artifact@v8
+        with:
+          pattern: alibaba-or-${{ needs.prepare.outputs.day_id }}h*
+          path: day-output
+          merge-multiple: true
+
+      - name: Build day manifest
+        shell: bash
+        env:
+          DAY: ${{ needs.prepare.outputs.day }}
+          DAY_ID: ${{ needs.prepare.outputs.day_id }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          root = Path('day-output')
+          manifests = sorted(root.glob('manifest_or_d???h??.json'))
+          if len(manifests) != 24:
+              raise SystemExit(f'expected 24 hourly manifests, found {len(manifests)}')
+
+          hours = [json.loads(p.read_text()) for p in manifests]
+          summary = {
+              'day': int(os.environ['DAY']),
+              'day_id': os.environ['DAY_ID'],
+              'hours': len(hours),
+              'slice_ids': [m['slice_id'] for m in hours],
+              'raw_range_bytes_total': sum(
+                  f['range_bytes_downloaded']
+                  for m in hours
+                  for f in m['raw_range_manifest']['files']
+              ),
+              'derived_bytes_total': sum(m['derived_bytes_total'] for m in hours),
+              'rows_total': {
+                  key: sum(m['derived'][key]['rows'] for m in hours)
+                  for key in ('jobs', 'placements', 'servers')
+              },
+          }
+          (root / f"manifest_or_{os.environ['DAY_ID']}.json").write_text(
+              json.dumps(summary, indent=2) + '\n'
+          )
+          print(json.dumps(summary, indent=2))
+          PY
+          du -sh day-output
+
+      - name: Upload one day-level OR bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: alibaba-or-${{ needs.prepare.outputs.day_id }}-bundle
+          path: day-output/
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
