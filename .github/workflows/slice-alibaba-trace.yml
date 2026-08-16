@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -81,7 +81,7 @@ jobs:
           du -h slice-output/*
 
       - name: Upload numbered slice
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: alibaba-${{ steps.slice.outputs.id }}
           path: slice-output/
